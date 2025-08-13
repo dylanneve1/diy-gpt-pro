@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import asyncio
 import json
 import os
@@ -11,7 +13,6 @@ from typing import Dict, List, Optional
 
 from openai import AsyncOpenAI
 
-# --- Rich TUI ---
 from rich.live import Live
 from rich.table import Table
 from rich.console import Console, Group
@@ -23,13 +24,14 @@ console = Console()
 
 # ------------------ Config ------------------
 
-MODEL = "gpt-5"              # all Workers + Synth use GPT-5
+CURRENT_MODEL = "gpt-5"       # default; switch via /settings (gpt-5 | gpt-5-mini | gpt-5-nano)
+MODEL_CHOICES = ["gpt-5", "gpt-5-mini", "gpt-5-nano"]
+
 N_WORKERS = 4
 WORKER_NAMES = [f"Worker-{i+1}" for i in range(N_WORKERS)]
 
-# Default reasoning settings (editable in /settings)
-REASONING_LEVEL = "medium"    # minimal | low | medium | high
-TEXT_VERBOSITY = "low"        # keep answers concise
+REASONING_LEVEL = "medium"    # minimal | low | medium | high (switch via /settings)
+TEXT_VERBOSITY = "low"
 
 WORKER_INSTRUCTION = (
     "You are a Worker. Read the chat so far and the latest user message. "
@@ -43,10 +45,8 @@ SYNTH_INSTRUCTION = (
     "Be decisive, accurate, and concise. Output only the final answer—no preamble."
 )
 
-# Settings
-LOG_ALL_TO_FILE: bool = False  # toggled via /settings
+LOG_ALL_TO_FILE: bool = False
 
-# Sessions
 SESS_DIR = Path("sessions")
 SESS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -59,7 +59,7 @@ class AgentState:
     model: str
     started_at: float = field(default_factory=time.time)
     ended_at: Optional[float] = None
-    ok: Optional[bool] = None          # None=running, True=done, False=error
+    ok: Optional[bool] = None
     error: Optional[str] = None
     output_text: Optional[str] = None
 
@@ -98,26 +98,23 @@ def _extract_output_text(resp) -> str:
 
 async def call_worker(client: AsyncOpenAI, history: List[Dict[str, str]]) -> str:
     resp = await client.responses.create(
-        model=MODEL,
+        model=CURRENT_MODEL,
         instructions=WORKER_INSTRUCTION,
-        input=history,                 # full chat so far
-        reasoning=reasoning_dict(),    # all Workers use current reasoning level
+        input=history,
+        reasoning=reasoning_dict(),
         text=text_dict(),
-        # no max_output_tokens -> use model default
     )
     return _extract_output_text(resp)
-
 
 async def call_synth(client: AsyncOpenAI, history: List[Dict[str, str]], drafts: Dict[str, str]) -> str:
     stitched = "\n\n".join(f"### {name}\n{text.strip()}" for name, text in drafts.items())
     synth_input = history + [{"role": "assistant", "content": "WORKER DRAFTS:\n" + stitched}]
     resp = await client.responses.create(
-        model=MODEL,
+        model=CURRENT_MODEL,
         instructions=SYNTH_INSTRUCTION,
         input=synth_input,
-        reasoning=reasoning_dict(),    # Synth uses the same chosen reasoning level
+        reasoning=reasoning_dict(),
         text=text_dict(),
-        # no max_output_tokens -> use model default
     )
     return _extract_output_text(resp)
 
@@ -152,7 +149,7 @@ def render_dashboard(states: List[AgentState], synth: Optional[AgentState]) -> P
             status_cell = Text(f" error ✗ {synth.error or ''}", style="red")
         tbl.add_row(synth.name, synth.model, status_cell, fmt_elapsed(synth.elapsed))
 
-    title = Text(f"Multi-Worker Orchestrator (GPT-5, reasoning={REASONING_LEVEL})", style="bold")
+    title = Text(f"Multi-Worker Orchestrator ({CURRENT_MODEL}, reasoning={REASONING_LEVEL})", style="bold")
     return Panel(tbl, title=title, border_style="cyan")
 
 
@@ -228,8 +225,8 @@ def load_session(name: str) -> Optional[List[Dict[str, str]]]:
 # ------------------ Orchestrator (per-turn) ------------------
 
 async def run_turn(client: AsyncOpenAI, history: List[Dict[str, str]]) -> str:
-    states: List[AgentState] = [AgentState(name=WORKER_NAMES[i], model=MODEL) for i in range(N_WORKERS)]
-    synth_state = AgentState(name="Synthesizer", model=MODEL)
+    states: List[AgentState] = [AgentState(name=WORKER_NAMES[i], model=CURRENT_MODEL) for i in range(N_WORKERS)]
+    synth_state = AgentState(name="Synthesizer", model=CURRENT_MODEL)
 
     async def _run_worker(i: int):
         st = states[i]
@@ -281,14 +278,15 @@ async def run_turn(client: AsyncOpenAI, history: List[Dict[str, str]]) -> str:
 # ------------------ Settings Menu ------------------
 
 def settings_menu() -> None:
-    global LOG_ALL_TO_FILE, REASONING_LEVEL
+    global LOG_ALL_TO_FILE, REASONING_LEVEL, CURRENT_MODEL
     levels = ["minimal", "low", "medium", "high"]
     while True:
         console.print("\n[bold cyan]Settings[/bold cyan]")
         log_status = "[green]ON[/green]" if LOG_ALL_TO_FILE else "[red]OFF[/red]"
         console.print(f"  1) Log all model responses to TXT file: {log_status}")
         console.print(f"  2) Reasoning level: [bold]{REASONING_LEVEL}[/bold] (choices: {', '.join(levels)})")
-        console.print("  t) Toggle logging   r) Set reasoning   q) Back\n")
+        console.print(f"  3) Model: [bold]{CURRENT_MODEL}[/bold] (choices: {', '.join(MODEL_CHOICES)})")
+        console.print("  t) Toggle logging   r) Set reasoning   m) Set model   q) Back\n")
         choice = input("> ").strip().lower()
         if choice in ("1", "t", "toggle"):
             LOG_ALL_TO_FILE = not LOG_ALL_TO_FILE
@@ -299,6 +297,13 @@ def settings_menu() -> None:
                 console.print(f"[green]Reasoning set to {REASONING_LEVEL}[/green]")
             else:
                 console.print("[red]Invalid level.[/red]")
+        elif choice in ("3", "m", "model"):
+            new_model = input(f"Enter model ({', '.join(MODEL_CHOICES)}): ").strip()
+            if new_model in MODEL_CHOICES:
+                CURRENT_MODEL = new_model
+                console.print(f"[green]Model set to {CURRENT_MODEL}[/green]")
+            else:
+                console.print("[red]Invalid model.[/red]")
         elif choice in ("q", "b", "back", ""):
             break
 
@@ -309,14 +314,13 @@ def main():
     client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
     history: List[Dict[str, str]] = []
 
-    console.print("[bold]Multi-Worker Orchestrator (GPT-5)[/bold] — commands: /list, /save <n>, /load <n>, /settings, /exit")
+    console.print("[bold]Multi-Worker Orchestrator[/bold] — commands: /list, /save <n>, /load <n>, /settings, /exit")
 
     while True:
         user_in = input("\nYou: ").strip()
         if not user_in:
             continue
 
-        # Commands
         if user_in.startswith("/exit"):
             break
 
@@ -354,10 +358,9 @@ def main():
             console.print(f"[green]Loaded[/green] session '{_slug(parts[1])}' with {len(history)} messages.")
             continue
 
-        # Normal chat turn
         history.append({"role": "user", "content": user_in})
         final_answer = asyncio.run(run_turn(client, history))
-        print(final_answer)  # only the final merged answer
+        print(final_answer)
         history.append({"role": "assistant", "content": final_answer})
 
     console.print("[dim]Bye.[/dim]")
