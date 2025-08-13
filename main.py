@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import asyncio
+import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from openai import AsyncOpenAI
 
@@ -20,32 +23,32 @@ console = Console()
 
 # ------------------ Config ------------------
 
-AGENT_MODELS: List[str] = [
-    "gpt-5",        # Planner
-    "gpt-5-mini",   # Explainer
-    "gpt-5-nano",   # Optimizer
-    "gpt-5",        # Skeptic
-]
+MODEL = "gpt-5"              # all Workers + Synth use GPT-5
+N_WORKERS = 4
+WORKER_NAMES = [f"Worker-{i+1}" for i in range(N_WORKERS)]
 
-AGENT_ROLES: List[str] = [
-    "You are the Planner. Produce a tight, step-by-step plan tailored to the user prompt.",
-    "You are the Explainer. Give a clear, concise explanation anyone can follow.",
-    "You are the Optimizer. Improve efficiency, latency, and cost; propose a refined approach.",
-    "You are the Skeptic. Find flaws, edge cases, and risks; propose mitigations.",
-]
+# Default reasoning settings (editable in /settings)
+REASONING_LEVEL = "medium"    # minimal | low | medium | high
+TEXT_VERBOSITY = "low"        # keep answers concise
 
-SYNTH_MODEL = "gpt-5"
-AGENT_MAX_TOKENS = 500
-SYNTH_MAX_TOKENS = 900
+WORKER_INSTRUCTION = (
+    "You are a Worker. Read the chat so far and the latest user message. "
+    "Use brief internal reasoning, then return a complete, correct, and concise draft answer. "
+    "No preamble; focus on the solution."
+)
 
-# GPT-5 per docs: minimal reasoning + verbosity control (no temperature for reasoning models)
-AGENT_REASONING = {"effort": "minimal"}   # fastest agents
-SYNTH_REASONING = {"effort": "medium"}    # judge thinks a bit more
-AGENT_TEXT = {"verbosity": "low"}
-SYNTH_TEXT = {"verbosity": "low"}
+SYNTH_INSTRUCTION = (
+    "You are the Synthesizer. Read the chat so far and the four Worker drafts. "
+    "Merge the best ideas, resolve conflicts, and produce ONE polished answer. "
+    "Be decisive, accurate, and concise. Output only the final answer—no preamble."
+)
 
-# Settings (toggle via /settings)
-LOG_ALL_TO_FILE: bool = False   # when True, dump full trace to ./gpt5_trace_<ts>.txt
+# Settings
+LOG_ALL_TO_FILE: bool = False  # toggled via /settings
+
+# Sessions
+SESS_DIR = Path("sessions")
+SESS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ------------------ State ------------------
@@ -66,14 +69,18 @@ class AgentState:
         return max(0.0, end - self.started_at)
 
 
-# ------------------ OpenAI Calls ------------------
+# ------------------ Helpers ------------------
+
+def reasoning_dict() -> Dict[str, str]:
+    return {"effort": REASONING_LEVEL}
+
+def text_dict() -> Dict[str, str]:
+    return {"verbosity": TEXT_VERBOSITY}
 
 def _extract_output_text(resp) -> str:
-    # Prefer convenience property if present
     txt = getattr(resp, "output_text", None)
     if isinstance(txt, str) and txt.strip():
         return txt.strip()
-    # Fallback: scan structured output
     try:
         chunks = []
         for item in getattr(resp, "output", []):
@@ -87,35 +94,30 @@ def _extract_output_text(resp) -> str:
     return str(resp)
 
 
-async def call_agent(client: AsyncOpenAI, role: str, model: str, user_prompt: str) -> str:
+# ------------------ OpenAI Calls ------------------
+
+async def call_worker(client: AsyncOpenAI, history: List[Dict[str, str]]) -> str:
     resp = await client.responses.create(
-        model=model,
-        instructions=role,
-        input=user_prompt,                 # single-string input per GPT-5 Responses API
-        reasoning=AGENT_REASONING,         # {"effort":"minimal"}
-        text=AGENT_TEXT,                   # {"verbosity":"low"}
-        max_output_tokens=AGENT_MAX_TOKENS,
+        model=MODEL,
+        instructions=WORKER_INSTRUCTION,
+        input=history,                 # full chat so far
+        reasoning=reasoning_dict(),    # all Workers use current reasoning level
+        text=text_dict(),
+        # no max_output_tokens -> use model default
     )
     return _extract_output_text(resp)
 
 
-async def call_synth(client: AsyncOpenAI, model: str, user_prompt: str,
-                     panel: Dict[str, Tuple[str, str]]) -> str:
-    stitched = "\n\n".join(
-        f"### {name} ({mdl})\n{text.strip()}" for name, (mdl, text) in panel.items()
-    )
-    synth_instructions = (
-        "You are the Synthesizer. Read the user prompt and the four agent drafts. "
-        "Merge the best ideas, resolve conflicts, and return ONE polished answer. "
-        "Be decisive and concise. Only output the final answer—no preamble."
-    )
+async def call_synth(client: AsyncOpenAI, history: List[Dict[str, str]], drafts: Dict[str, str]) -> str:
+    stitched = "\n\n".join(f"### {name}\n{text.strip()}" for name, text in drafts.items())
+    synth_input = history + [{"role": "assistant", "content": "WORKER DRAFTS:\n" + stitched}]
     resp = await client.responses.create(
-        model=model,
-        instructions=synth_instructions,
-        input=f"USER PROMPT:\n{user_prompt.strip()}\n\nPANEL RESPONSES:\n{stitched}",
-        reasoning=SYNTH_REASONING,
-        text=SYNTH_TEXT,
-        max_output_tokens=SYNTH_MAX_TOKENS,
+        model=MODEL,
+        instructions=SYNTH_INSTRUCTION,
+        input=synth_input,
+        reasoning=reasoning_dict(),    # Synth uses the same chosen reasoning level
+        text=text_dict(),
+        # no max_output_tokens -> use model default
     )
     return _extract_output_text(resp)
 
@@ -125,10 +127,9 @@ async def call_synth(client: AsyncOpenAI, model: str, user_prompt: str,
 def fmt_elapsed(sec: float) -> str:
     return f"{int(sec//60):02d}:{int(sec%60):02d}"
 
-
 def render_dashboard(states: List[AgentState], synth: Optional[AgentState]) -> Panel:
     tbl = Table(show_header=True, header_style="bold", expand=True, pad_edge=False)
-    tbl.add_column("Agent", no_wrap=True)
+    tbl.add_column("Worker", no_wrap=True)
     tbl.add_column("Model", no_wrap=True)
     tbl.add_column("Status", ratio=1)
     tbl.add_column("Elapsed", no_wrap=True)
@@ -151,21 +152,25 @@ def render_dashboard(states: List[AgentState], synth: Optional[AgentState]) -> P
             status_cell = Text(f" error ✗ {synth.error or ''}", style="red")
         tbl.add_row(synth.name, synth.model, status_cell, fmt_elapsed(synth.elapsed))
 
-    title = Text("Multi-Agent Orchestrator (GPT-5)", style="bold")
+    title = Text(f"Multi-Worker Orchestrator (GPT-5, reasoning={REASONING_LEVEL})", style="bold")
     return Panel(tbl, title=title, border_style="cyan")
 
 
 # ------------------ Logging ------------------
 
-def build_full_trace(user_prompt: str, states: List[AgentState], synth: AgentState) -> str:
+def build_full_trace(user_msg: str, states: List[AgentState], synth: AgentState, history: List[Dict[str, str]]) -> str:
     lines = []
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     lines.append(f"[Run @ {ts}]")
     lines.append("")
-    lines.append("=== USER PROMPT ===")
-    lines.append(user_prompt.strip())
+    lines.append("=== CHAT HISTORY BEFORE THIS TURN ===")
+    for m in history[:-1]:
+        lines.append(f"{m['role']}: {m['content']}")
     lines.append("")
-    lines.append("=== AGENT DRAFTS ===")
+    lines.append("=== LATEST USER MESSAGE ===")
+    lines.append(user_msg.strip())
+    lines.append("")
+    lines.append("=== WORKER DRAFTS ===")
     for st in states:
         lines.append(f"\n--- {st.name} ({st.model}) | elapsed {fmt_elapsed(st.elapsed)} | "
                      f"status: {'ok' if st.ok else 'error' if st.ok is False else 'running'} ---")
@@ -181,7 +186,6 @@ def build_full_trace(user_prompt: str, states: List[AgentState], synth: AgentSta
     lines.append("")
     return "\n".join(lines)
 
-
 def write_trace_to_file(content: str) -> str:
     ts = time.strftime("%Y%m%d-%H%M%S")
     fname = f"gpt5_trace_{ts}.txt"
@@ -191,23 +195,46 @@ def write_trace_to_file(content: str) -> str:
     return path
 
 
-# ------------------ Orchestrator ------------------
+# ------------------ Sessions ------------------
 
-async def orchestrate(user_prompt: str, log_all: bool = False) -> str:
-    client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+def _slug(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_\-]+", "_", name).strip("_") or "session"
 
-    states: List[AgentState] = [
-        AgentState(name="Planner",   model=AGENT_MODELS[0]),
-        AgentState(name="Explainer", model=AGENT_MODELS[1]),
-        AgentState(name="Optimizer", model=AGENT_MODELS[2]),
-        AgentState(name="Skeptic",   model=AGENT_MODELS[3]),
-    ]
-    synth_state = AgentState(name="Synthesizer", model=SYNTH_MODEL)
+def list_sessions() -> List[str]:
+    return sorted([p.stem for p in SESS_DIR.glob("*.json")])
 
-    async def _run_agent(i: int):
+def save_session(name: str, history: List[Dict[str, str]]) -> str:
+    fname = _slug(name) + ".json"
+    path = SESS_DIR / fname
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"messages": history}, f, ensure_ascii=False, indent=2)
+    return str(path)
+
+def load_session(name: str) -> Optional[List[Dict[str, str]]]:
+    fname = _slug(name) + ".json"
+    path = SESS_DIR / fname
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    msgs = data.get("messages", [])
+    out = []
+    for m in msgs:
+        if isinstance(m, dict) and "role" in m and "content" in m:
+            out.append({"role": str(m["role"]), "content": str(m["content"])})
+    return out
+
+
+# ------------------ Orchestrator (per-turn) ------------------
+
+async def run_turn(client: AsyncOpenAI, history: List[Dict[str, str]]) -> str:
+    states: List[AgentState] = [AgentState(name=WORKER_NAMES[i], model=MODEL) for i in range(N_WORKERS)]
+    synth_state = AgentState(name="Synthesizer", model=MODEL)
+
+    async def _run_worker(i: int):
         st = states[i]
         try:
-            out = await call_agent(client, AGENT_ROLES[i], st.model, user_prompt)
+            out = await call_worker(client, history)
             st.output_text = out
             st.ok = True
         except Exception as e:
@@ -216,10 +243,9 @@ async def orchestrate(user_prompt: str, log_all: bool = False) -> str:
         finally:
             st.ended_at = time.time()
 
-    tasks = [asyncio.create_task(_run_agent(i)) for i in range(4)]
+    tasks = [asyncio.create_task(_run_worker(i)) for i in range(N_WORKERS)]
 
-    # Live TUI while agents run and during synthesis
-    with Live(render_dashboard(states, None), console=console, refresh_per_second=12) as live:
+    with Live(render_dashboard(states, None), console=console, refresh_per_second=14) as live:
         while any(st.ok is None for st in states):
             await asyncio.sleep(0.08)
             live.update(render_dashboard(states, None))
@@ -228,8 +254,8 @@ async def orchestrate(user_prompt: str, log_all: bool = False) -> str:
         synth_state.started_at = time.time()
         live.update(render_dashboard(states, synth_state))
         try:
-            panel_map: Dict[str, Tuple[str, str]] = {st.name: (st.model, st.output_text or "") for st in states}
-            final = await call_synth(client, SYNTH_MODEL, user_prompt, panel_map)
+            drafts_map: Dict[str, str] = {st.name: (st.output_text or "") for st in states}
+            final = await call_synth(client, history, drafts_map)
             synth_state.ok = True
             synth_state.output_text = final
         except Exception as e:
@@ -241,13 +267,12 @@ async def orchestrate(user_prompt: str, log_all: bool = False) -> str:
             live.update(render_dashboard(states, synth_state))
             await asyncio.sleep(0.35)
 
-    # Optional: silent dump of the full trace to a TXT file
-    if log_all:
+    if LOG_ALL_TO_FILE:
         try:
-            trace = build_full_trace(user_prompt, states, synth_state)
+            user_msg = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+            trace = build_full_trace(user_msg, states, synth_state, history)
             write_trace_to_file(trace)
         except Exception:
-            # Silent failure by design—no extra console noise
             pass
 
     return synth_state.output_text or ""
@@ -256,37 +281,86 @@ async def orchestrate(user_prompt: str, log_all: bool = False) -> str:
 # ------------------ Settings Menu ------------------
 
 def settings_menu() -> None:
-    global LOG_ALL_TO_FILE
+    global LOG_ALL_TO_FILE, REASONING_LEVEL
+    levels = ["minimal", "low", "medium", "high"]
     while True:
         console.print("\n[bold cyan]Settings[/bold cyan]")
-        status = "[green]ON[/green]" if LOG_ALL_TO_FILE else "[red]OFF[/red]"
-        console.print(f"  1) Log all model responses to TXT file: {status}")
-        console.print("  t) Toggle   q) Back\n")
+        log_status = "[green]ON[/green]" if LOG_ALL_TO_FILE else "[red]OFF[/red]"
+        console.print(f"  1) Log all model responses to TXT file: {log_status}")
+        console.print(f"  2) Reasoning level: [bold]{REASONING_LEVEL}[/bold] (choices: {', '.join(levels)})")
+        console.print("  t) Toggle logging   r) Set reasoning   q) Back\n")
         choice = input("> ").strip().lower()
         if choice in ("1", "t", "toggle"):
             LOG_ALL_TO_FILE = not LOG_ALL_TO_FILE
+        elif choice in ("2", "r", "reasoning"):
+            new_level = input("Enter reasoning level (minimal|low|medium|high): ").strip().lower()
+            if new_level in levels:
+                REASONING_LEVEL = new_level
+                console.print(f"[green]Reasoning set to {REASONING_LEVEL}[/green]")
+            else:
+                console.print("[red]Invalid level.[/red]")
         elif choice in ("q", "b", "back", ""):
             break
 
 
-# ------------------ CLI ------------------
+# ------------------ CLI Loop ------------------
 
 def main():
-    global LOG_ALL_TO_FILE
+    client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    history: List[Dict[str, str]] = []
+
+    console.print("[bold]Multi-Worker Orchestrator (GPT-5)[/bold] — commands: /list, /save <n>, /load <n>, /settings, /exit")
+
     while True:
-        prompt = input("Enter your prompt (or /settings, or blank to quit): ").strip()
-        if not prompt:
+        user_in = input("\nYou: ").strip()
+        if not user_in:
+            continue
+
+        # Commands
+        if user_in.startswith("/exit"):
             break
-        if prompt.startswith("/settings"):
+
+        if user_in.startswith("/settings"):
             settings_menu()
             continue
 
-        # Run once and print ONLY the final synthesized answer
-        final_answer = asyncio.run(orchestrate(prompt, log_all=LOG_ALL_TO_FILE))
-        print(final_answer)
+        if user_in.startswith("/list"):
+            items = list_sessions()
+            if items:
+                console.print("[bold cyan]Saved sessions:[/bold cyan] " + ", ".join(items))
+            else:
+                console.print("[dim]No saved sessions.[/dim]")
+            continue
 
-        # Single-shot run; comment the next line if you want to loop for multiple prompts
-        break
+        if user_in.startswith("/save"):
+            parts = user_in.split(maxsplit=1)
+            if len(parts) < 2:
+                console.print("[red]Usage: /save <name>[/red]")
+                continue
+            path = save_session(parts[1], history)
+            console.print(f"[green]Saved[/green] → {path}")
+            continue
+
+        if user_in.startswith("/load"):
+            parts = user_in.split(maxsplit=1)
+            if len(parts) < 2:
+                console.print("[red]Usage: /load <name>[/red]")
+                continue
+            msgs = load_session(parts[1])
+            if msgs is None:
+                console.print("[red]Not found.[/red]")
+                continue
+            history = msgs
+            console.print(f"[green]Loaded[/green] session '{_slug(parts[1])}' with {len(history)} messages.")
+            continue
+
+        # Normal chat turn
+        history.append({"role": "user", "content": user_in})
+        final_answer = asyncio.run(run_turn(client, history))
+        print(final_answer)  # only the final merged answer
+        history.append({"role": "assistant", "content": final_answer})
+
+    console.print("[dim]Bye.[/dim]")
 
 
 if __name__ == "__main__":
