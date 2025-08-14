@@ -24,7 +24,7 @@ console = Console()
 
 # ------------------ Config ------------------
 
-CURRENT_MODEL = "gpt-5"       # default; switch via /settings (gpt-5 | gpt-5-mini | gpt-5-nano)
+CURRENT_MODEL = "gpt-5"       # switch via /settings (gpt-5 | gpt-5-mini | gpt-5-nano)
 MODEL_CHOICES = ["gpt-5", "gpt-5-mini", "gpt-5-nano"]
 
 N_WORKERS = 4
@@ -32,6 +32,10 @@ WORKER_NAMES = [f"Worker-{i+1}" for i in range(N_WORKERS)]
 
 REASONING_LEVEL = "medium"    # minimal | low | medium | high (switch via /settings)
 TEXT_VERBOSITY = "low"
+
+# Retry policy
+RETRY_MAX = 5
+RETRY_DELAY_SEC = 5
 
 WORKER_INSTRUCTION = (
     "You are a Worker. Read the chat so far and the latest user message. "
@@ -71,6 +75,21 @@ class AgentState:
 
 # ------------------ Helpers ------------------
 
+def create_client_no_timeout() -> AsyncOpenAI:
+    """
+    Construct an AsyncOpenAI client with NO request timeout.
+    Falls back gracefully if the SDK version doesn't accept a timeout arg.
+    """
+    try:
+        return AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=None)
+    except TypeError:
+        try:
+            import httpx
+            http_client = httpx.AsyncClient(timeout=None)
+            return AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"), http_client=http_client)
+        except Exception:
+            return AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
 def reasoning_dict() -> Dict[str, str]:
     return {"effort": REASONING_LEVEL}
 
@@ -94,28 +113,44 @@ def _extract_output_text(resp) -> str:
     return str(resp)
 
 
-# ------------------ OpenAI Calls ------------------
+# ------------------ OpenAI Calls (with retries) ------------------
+
+async def _request_with_retries(func, *args, **kwargs):
+    last_err = None
+    for attempt in range(1, RETRY_MAX + 1):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            if attempt < RETRY_MAX:
+                await asyncio.sleep(RETRY_DELAY_SEC)
+            else:
+                raise last_err
 
 async def call_worker(client: AsyncOpenAI, history: List[Dict[str, str]]) -> str:
-    resp = await client.responses.create(
-        model=CURRENT_MODEL,
-        instructions=WORKER_INSTRUCTION,
-        input=history,
-        reasoning=reasoning_dict(),
-        text=text_dict(),
-    )
+    async def _do():
+        return await client.responses.create(
+            model=CURRENT_MODEL,
+            instructions=WORKER_INSTRUCTION,
+            input=history,
+            reasoning=reasoning_dict(),
+            text=text_dict(),
+        )
+    resp = await _request_with_retries(_do)
     return _extract_output_text(resp)
 
 async def call_synth(client: AsyncOpenAI, history: List[Dict[str, str]], drafts: Dict[str, str]) -> str:
     stitched = "\n\n".join(f"### {name}\n{text.strip()}" for name, text in drafts.items())
     synth_input = history + [{"role": "assistant", "content": "WORKER DRAFTS:\n" + stitched}]
-    resp = await client.responses.create(
-        model=CURRENT_MODEL,
-        instructions=SYNTH_INSTRUCTION,
-        input=synth_input,
-        reasoning=reasoning_dict(),
-        text=text_dict(),
-    )
+    async def _do():
+        return await client.responses.create(
+            model=CURRENT_MODEL,
+            instructions=SYNTH_INSTRUCTION,
+            input=synth_input,
+            reasoning=reasoning_dict(),
+            text=text_dict(),
+        )
+    resp = await _request_with_retries(_do)
     return _extract_output_text(resp)
 
 
@@ -244,7 +279,7 @@ async def run_turn(client: AsyncOpenAI, history: List[Dict[str, str]]) -> str:
 
     with Live(render_dashboard(states, None), console=console, refresh_per_second=14) as live:
         while any(st.ok is None for st in states):
-            await asyncio.sleep(0.08)
+            await asyncio.sleep(0.08)  # UI refresh cadence (not a network timeout)
             live.update(render_dashboard(states, None))
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -262,7 +297,6 @@ async def run_turn(client: AsyncOpenAI, history: List[Dict[str, str]]) -> str:
         finally:
             synth_state.ended_at = time.time()
             live.update(render_dashboard(states, synth_state))
-            await asyncio.sleep(0.35)
 
     if LOG_ALL_TO_FILE:
         try:
@@ -311,7 +345,7 @@ def settings_menu() -> None:
 # ------------------ CLI Loop ------------------
 
 def main():
-    client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    client = create_client_no_timeout()
     history: List[Dict[str, str]] = []
 
     console.print("[bold]Multi-Worker Orchestrator[/bold] — commands: /list, /save <n>, /load <n>, /settings, /exit")
