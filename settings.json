@@ -1,0 +1,14 @@
+{
+  "CURRENT_MODEL": "gpt-5",
+  "MODEL_CHOICES": [
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano"
+  ],
+  "REASONING_LEVEL": "high",
+  "TEXT_VERBOSITY": "low",
+  "LOG_ALL_TO_FILE": false,
+  "N_WORKERS": 4,
+  "RETRY_MAX": 5,
+  "RETRY_DELAY_SEC": 5
+}
