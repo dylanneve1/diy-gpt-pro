@@ -8,7 +8,6 @@ SESS_DIR = Path("sessions")
 SESS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ------------------ Defaults ------------------
-# Model & reasoning defaults (mutable; persisted to settings.json)
 MODEL_CHOICES = ["gpt-5", "gpt-5-mini", "gpt-5-nano"]
 CURRENT_MODEL: str = "gpt-5"                      # default; can be changed in /settings
 
@@ -25,6 +24,9 @@ RETRY_DELAY_SEC: int = 5
 
 # Logging
 LOG_ALL_TO_FILE: bool = False
+
+# Running token totals (accumulate across turns; persisted in session files via /save)
+RUNNING_TOKENS: dict = {"input": 0, "output": 0, "total": 0}
 
 # ------------------ System instructions ------------------
 WORKER_INSTRUCTION = (
@@ -45,7 +47,7 @@ def reasoning_dict():
 def text_dict():
     return {"verbosity": TEXT_VERBOSITY}
 
-# ------------------ Persistence ------------------
+# ------------------ Persistence (settings.json) ------------------
 def _validate_settings(data: dict) -> dict:
     """Coerce/validate incoming settings dict; fall back to current globals if invalid."""
     global CURRENT_MODEL, REASONING_LEVEL, TEXT_VERBOSITY, LOG_ALL_TO_FILE, N_WORKERS, RETRY_MAX, RETRY_DELAY_SEC
@@ -54,10 +56,7 @@ def _validate_settings(data: dict) -> dict:
 
     # CURRENT_MODEL
     model = data.get("CURRENT_MODEL", CURRENT_MODEL)
-    if model in MODEL_CHOICES:
-        out["CURRENT_MODEL"] = model
-    else:
-        out["CURRENT_MODEL"] = CURRENT_MODEL
+    out["CURRENT_MODEL"] = model if model in MODEL_CHOICES else CURRENT_MODEL
 
     # REASONING_LEVEL
     allowed_levels = {"minimal", "low", "medium", "high"}
@@ -72,7 +71,7 @@ def _validate_settings(data: dict) -> dict:
     # LOG_ALL_TO_FILE
     out["LOG_ALL_TO_FILE"] = bool(data.get("LOG_ALL_TO_FILE", LOG_ALL_TO_FILE))
 
-    # N_WORKERS (keep sane bounds 1..8)
+    # N_WORKERS (1..8)
     try:
         n = int(data.get("N_WORKERS", N_WORKERS))
         out["N_WORKERS"] = max(1, min(8, n))
@@ -106,11 +105,10 @@ def _apply_settings(valid: dict) -> None:
     N_WORKERS       = valid["N_WORKERS"]
     RETRY_MAX       = int(valid["RETRY_MAX"])
     RETRY_DELAY_SEC = float(valid["RETRY_DELAY_SEC"])
-    # regenerate worker names if the count changed
     WORKER_NAMES[:] = [f"Worker-{i+1}" for i in range(N_WORKERS)]
 
 def to_dict() -> dict:
-    """Export current settings to a JSON-serializable dict."""
+    """Export current settings to a JSON-serializable dict (not session tokens)."""
     return {
         "CURRENT_MODEL": CURRENT_MODEL,
         "MODEL_CHOICES": MODEL_CHOICES,           # informational
@@ -131,7 +129,6 @@ def load_settings() -> None:
         valid = _validate_settings(data or {})
         _apply_settings(valid)
     except Exception:
-        # On any failure, keep defaults
         pass
 
 def save_settings() -> None:
@@ -142,7 +139,6 @@ def save_settings() -> None:
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(SETTINGS_PATH)
     except Exception:
-        # Silently ignore persistence errors to avoid interrupting UX
         pass
 
 # Load persisted settings on import

@@ -17,12 +17,13 @@ def fmt_elapsed(sec: float) -> str:
 
 def _stats_footer(stats: dict) -> Panel:
     """
-    Build a compact stats footer panel.
-    Expected keys in stats:
-      - elapsed (float seconds)
-      - workers_done, workers_err, workers_run, workers_total (ints)
-      - worker_avg (float seconds), worker_max (float seconds)
-      - retries_total (int), retry_events (int)
+    Compact stats footer panel.
+    Keys (all optional, default 0):
+      elapsed, workers_done, workers_err, workers_run, workers_total,
+      worker_avg, worker_max,
+      retries_total, retry_events,
+      tokens_input, tokens_output, tokens_total,            # this turn
+      tokens_run_input, tokens_run_output, tokens_run_total # running (Σ)
     """
     footer = Table.grid(expand=True)
     footer.add_column(ratio=1)
@@ -53,12 +54,26 @@ def _stats_footer(stats: dict) -> Panel:
         fmt_elapsed(stats.get("worker_max", 0.0)),
     )
 
+    # Tokens: show per-turn and cumulative Σ side by side
+    t_in  = stats.get("tokens_input", 0)
+    t_out = stats.get("tokens_output", 0)
+    t_tot = stats.get("tokens_total", 0)
+
+    r_in  = stats.get("tokens_run_input", 0)
+    r_out = stats.get("tokens_run_output", 0)
+    r_tot = stats.get("tokens_run_total", 0)
+
     right = Text.assemble(
         ("Retries: ", "bold"),
         f"{stats.get('retries_total', 0)}",
         "  (events ",
         f"{stats.get('retry_events', 0)}",
-        ")"
+        ")   ",
+        ("Tokens ", "bold"),
+        f"turn in:{t_in} / out:{t_out} / total:{t_tot}",
+        "   ",
+        ("Σ ", "bold"),
+        f"in:{r_in} / out:{r_out} / total:{r_tot}",
     )
 
     footer.add_row(left, mid, Align.right(right))

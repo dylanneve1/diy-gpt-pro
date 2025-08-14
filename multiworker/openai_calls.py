@@ -2,14 +2,14 @@
 import asyncio
 import re
 import math
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from openai import AsyncOpenAI
 
 from . import config
 
 # ---------- Retry telemetry (for Stats footer) ----------
-_RETRY_COUNT = 0          # total number of retry attempts (sleeps)
-_RETRY_EVENTS = 0         # number of requests that required at least one retry
+_RETRY_COUNT = 0                 # total number of retry attempts (sleeps)
+_RETRY_EVENTS = 0                # number of requests that required at least one retry
 _RETRY_DELAYS: list[float] = []  # seconds slept per retry
 
 
@@ -43,6 +43,26 @@ def _extract_output_text(resp) -> str:
     except Exception:
         pass
     return str(resp)
+
+
+def _extract_usage(resp) -> Dict[str, int]:
+    """
+    Try to pull token usage from response.
+    Returns dict with keys: input, output, total. Falls back to zeros.
+    """
+    input_t = output_t = total_t = 0
+    try:
+        usage = getattr(resp, "usage", None) or {}
+        # Some SDKs use attributes, others dict-like
+        input_t = getattr(usage, "input_tokens", None) or usage.get("input_tokens", 0)
+        output_t = getattr(usage, "output_tokens", None) or usage.get("output_tokens", 0)
+        total_t = getattr(usage, "total_tokens", None) or usage.get("total_tokens", 0)
+        # Fallback compute total if missing
+        if not total_t:
+            total_t = int(input_t) + int(output_t)
+        return {"input": int(input_t or 0), "output": int(output_t or 0), "total": int(total_t or 0)}
+    except Exception:
+        return {"input": 0, "output": 0, "total": 0}
 
 
 async def _request_with_retries(coro_factory):
@@ -104,7 +124,7 @@ async def _request_with_retries(coro_factory):
                 raise last_err
 
 
-async def call_worker(client: AsyncOpenAI, history: List[Dict[str, str]]) -> str:
+async def call_worker(client: AsyncOpenAI, history: List[Dict[str, str]]) -> Tuple[str, Dict[str, int]]:
     async def _do():
         return await client.responses.create(
             model=config.CURRENT_MODEL,
@@ -114,10 +134,10 @@ async def call_worker(client: AsyncOpenAI, history: List[Dict[str, str]]) -> str
             text=config.text_dict(),
         )
     resp = await _request_with_retries(_do)
-    return _extract_output_text(resp)
+    return _extract_output_text(resp), _extract_usage(resp)
 
 
-async def call_synth(client: AsyncOpenAI, history: List[Dict[str, str]], drafts: Dict[str, str]) -> str:
+async def call_synth(client: AsyncOpenAI, history: List[Dict[str, str]], drafts: Dict[str, str]) -> Tuple[str, Dict[str, int]]:
     stitched = "\n\n".join(f"### {name}\n{text.strip()}" for name, text in drafts.items())
     synth_input = history + [{"role": "assistant", "content": "WORKER DRAFTS:\n" + stitched}]
     async def _do():
@@ -129,4 +149,4 @@ async def call_synth(client: AsyncOpenAI, history: List[Dict[str, str]], drafts:
             text=config.text_dict(),
         )
     resp = await _request_with_retries(_do)
-    return _extract_output_text(resp)
+    return _extract_output_text(resp), _extract_usage(resp)
