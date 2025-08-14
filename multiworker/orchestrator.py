@@ -1,5 +1,6 @@
 # File: multiworker/orchestrator.py
 import asyncio
+import time
 from typing import Dict, List
 
 from .types import AgentState
@@ -25,32 +26,42 @@ async def run_turn(client, history: List[Dict[str, str]]) -> str:
             st.ok = False
             st.error = str(e)
         finally:
-            import time
             st.ended_at = time.time()
 
     tasks = [asyncio.create_task(_run_worker(i)) for i in range(config.N_WORKERS)]
 
     # Live UI while workers run and synthesize
     with Live(render_dashboard(states, None), console=console, refresh_per_second=14) as live:
+        # Update while workers are running
         while any(st.ok is None for st in states):
             await asyncio.sleep(0.08)
             live.update(render_dashboard(states, None))
         await asyncio.gather(*tasks, return_exceptions=True)
 
-        synth_state.started_at = __import__("time").time()
+        # Start synthesizer and continuously refresh elapsed time while it runs
+        synth_state.started_at = time.time()
         live.update(render_dashboard(states, synth_state))
-        try:
-            drafts_map: Dict[str, str] = {st.name: (st.output_text or "") for st in states}
-            final = await call_synth(client, history, drafts_map)
-            synth_state.ok = True
-            synth_state.output_text = final
-        except Exception as e:
-            synth_state.ok = False
-            synth_state.error = str(e)
-            synth_state.output_text = ""
-        finally:
-            synth_state.ended_at = __import__("time").time()
+
+        async def _do_synth():
+            try:
+                drafts_map: Dict[str, str] = {st.name: (st.output_text or "") for st in states}
+                final = await call_synth(client, history, drafts_map)
+                synth_state.ok = True
+                synth_state.output_text = final
+            except Exception as e:
+                synth_state.ok = False
+                synth_state.error = str(e)
+                synth_state.output_text = ""
+            finally:
+                synth_state.ended_at = time.time()
+
+        synth_task = asyncio.create_task(_do_synth())
+        while not synth_task.done():
+            await asyncio.sleep(0.08)
+            # elapsed updates because AgentState.elapsed uses current time when ended_at is None
             live.update(render_dashboard(states, synth_state))
+        await synth_task  # propagate any exceptions already handled; ensures completion
+        live.update(render_dashboard(states, synth_state))
 
     if config.LOG_ALL_TO_FILE:
         try:
