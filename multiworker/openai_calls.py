@@ -7,6 +7,27 @@ from openai import AsyncOpenAI
 
 from . import config
 
+# ---------- Retry telemetry (for Stats footer) ----------
+_RETRY_COUNT = 0          # total number of retry attempts (sleeps)
+_RETRY_EVENTS = 0         # number of requests that required at least one retry
+_RETRY_DELAYS: list[float] = []  # seconds slept per retry
+
+
+def get_retry_stats(reset: bool = False) -> dict:
+    """Return aggregate retry telemetry. Optionally reset after reading."""
+    global _RETRY_COUNT, _RETRY_EVENTS, _RETRY_DELAYS
+    stats = {
+        "retries_total": _RETRY_COUNT,
+        "retry_events": _RETRY_EVENTS,
+        "delays": list(_RETRY_DELAYS),
+    }
+    if reset:
+        _RETRY_COUNT = 0
+        _RETRY_EVENTS = 0
+        _RETRY_DELAYS.clear()
+    return stats
+
+
 def _extract_output_text(resp) -> str:
     txt = getattr(resp, "output_text", None)
     if isinstance(txt, str) and txt.strip():
@@ -23,15 +44,21 @@ def _extract_output_text(resp) -> str:
         pass
     return str(resp)
 
+
 async def _request_with_retries(coro_factory):
     """
     Retry wrapper:
       - Up to config.RETRY_MAX times
       - Waits at least config.RETRY_DELAY_SEC between tries
-      - If a 429 / rate-limit provides a suggested wait (Retry-After header or "try again in Xs"),
-        we sleep for max(RETRY_DELAY_SEC, suggested_wait).
+      - If a 429/rate-limit suggests a wait (Retry-After header or 'try again in Xs'),
+        sleep for max(RETRY_DELAY_SEC, suggested).
+      - Records telemetry for Stats footer.
     """
+    global _RETRY_COUNT, _RETRY_EVENTS, _RETRY_DELAYS
+
     last_err = None
+    any_retry_this_call = False
+
     for attempt in range(1, config.RETRY_MAX + 1):
         try:
             return await coro_factory()
@@ -41,23 +68,20 @@ async def _request_with_retries(coro_factory):
             # Base delay from config
             delay = float(config.RETRY_DELAY_SEC)
 
-            # Try to honor server-provided wait windows when present
-            # 1) Retry-After header (if SDK exposes response)
+            # Respect Retry-After header if available
             try:
                 resp = getattr(e, "response", None)
                 if resp is not None:
-                    # httpx.Response-like
                     ra = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
                     if ra:
                         try:
-                            suggested = float(ra)
-                            delay = max(delay, suggested)
+                            delay = max(delay, float(ra))
                         except Exception:
                             pass
             except Exception:
                 pass
 
-            # 2) Parse message text: "... Please try again in 29.786s."
+            # Parse "... Please try again in 29.786s."
             try:
                 msg = str(e)
                 m = re.search(r"try again in\s+([0-9]+(?:\.[0-9]+)?)s", msg, re.IGNORECASE)
@@ -68,9 +92,17 @@ async def _request_with_retries(coro_factory):
                 pass
 
             if attempt < config.RETRY_MAX:
+                # Telemetry
+                if not any_retry_this_call:
+                    _RETRY_EVENTS += 1
+                    any_retry_this_call = True
+                _RETRY_COUNT += 1
+                _RETRY_DELAYS.append(delay)
+
                 await asyncio.sleep(delay)
             else:
                 raise last_err
+
 
 async def call_worker(client: AsyncOpenAI, history: List[Dict[str, str]]) -> str:
     async def _do():
@@ -83,6 +115,7 @@ async def call_worker(client: AsyncOpenAI, history: List[Dict[str, str]]) -> str
         )
     resp = await _request_with_retries(_do)
     return _extract_output_text(resp)
+
 
 async def call_synth(client: AsyncOpenAI, history: List[Dict[str, str]], drafts: Dict[str, str]) -> str:
     stitched = "\n\n".join(f"### {name}\n{text.strip()}" for name, text in drafts.items())
